@@ -60,6 +60,12 @@ func (fs *NotImplementedFileSystem) ForgetInode(
 	return fuse.ENOSYS
 }
 
+func (fs *NotImplementedFileSystem) BatchForget(
+	ctx context.Context,
+	op *fuseops.BatchForgetOp) error {
+	return fuse.ENOSYS
+}
+
 func (fs *NotImplementedFileSystem) MkDir(
 	ctx context.Context,
 	op *fuseops.MkDirOp) error {
@@ -117,6 +123,12 @@ func (fs *NotImplementedFileSystem) OpenDir(
 func (fs *NotImplementedFileSystem) ReadDir(
 	ctx context.Context,
 	op *fuseops.ReadDirOp) error {
+	return fuse.ENOSYS
+}
+
+func (fs *NotImplementedFileSystem) ReadDirPlus(
+	ctx context.Context,
+	op *fuseops.ReadDirPlusOp) error {
 	return fuse.ENOSYS
 }
 
@@ -195,6 +207,12 @@ func (fs *NotImplementedFileSystem) SetXattr(
 func (fs *NotImplementedFileSystem) Fallocate(
 	ctx context.Context,
 	op *fuseops.FallocateOp) error {
+	return fuse.ENOSYS
+}
+
+func (fs *NotImplementedFileSystem) SyncFS(
+	ctx context.Context,
+	op *fuseops.SyncFSOp) error {
 	return fuse.ENOSYS
 }
 

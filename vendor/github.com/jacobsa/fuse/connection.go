@@ -39,17 +39,19 @@ var contextKey interface{} = contextKeyType(0)
 //
 // As of 2015-03-26, the behavior in the kernel is:
 //
-//  *  (http://goo.gl/bQ1f1i, http://goo.gl/HwBrR6) Set the local variable
-//     ra_pages to be init_response->max_readahead divided by the page size.
+//   - (https://tinyurl.com/2eakn5e9, https://tinyurl.com/mry9e33d) Set the
+//     local variable ra_pages to be init_response->max_readahead divided by
+//     the page size.
 //
-//  *  (http://goo.gl/gcIsSh, http://goo.gl/LKV2vA) Set
-//     backing_dev_info::ra_pages to the min of that value and what was sent
-//     in the request's max_readahead field.
+//   - (https://tinyurl.com/2eakn5e9, https://tinyurl.com/mbpshk8h) Set
+//     backing_dev_info::ra_pages to the min of that value and what was sent in
+//     the request's max_readahead field.
 //
-//  *  (http://goo.gl/u2SqzH) Use backing_dev_info::ra_pages when deciding
-//     how much to read ahead.
+//   - (https://tinyurl.com/57hpfu4x) Use backing_dev_info::ra_pages when
+//     deciding how much to read ahead.
 //
-//  *  (http://goo.gl/JnhbdL) Don't read ahead at all if that field is zero.
+//   - (https://tinyurl.com/ywhfcfte) Don't read ahead at all if that field is
+//     zero.
 //
 // Reading a page at a time is a drag. Ask for a larger size.
 const maxReadahead = 1 << 20
@@ -162,6 +164,14 @@ func (c *Connection) Init() error {
 	// Tell the kernel not to use pitifully small 4 KiB writes.
 	initOp.Flags |= fusekernel.InitBigWrites
 
+	if c.cfg.EnableAsyncReads {
+		initOp.Flags |= fusekernel.InitAsyncRead
+	}
+
+	// kernel 4.20 increases the max from 32 -> 256
+	initOp.Flags |= fusekernel.InitMaxPages
+	initOp.MaxPages = 256
+
 	// Enable writeback caching if the user hasn't asked us not to.
 	if !c.cfg.DisableWritebackCaching {
 		initOp.Flags |= fusekernel.InitWritebackCache
@@ -185,8 +195,26 @@ func (c *Connection) Init() error {
 		initOp.Flags |= fusekernel.InitNoOpendirSupport
 	}
 
-	c.Reply(ctx, nil)
-	return nil
+	// Tell the Kernel to allow sending parallel lookup and readdir operations.
+	if c.cfg.EnableParallelDirOps {
+		initOp.Flags |= fusekernel.InitParallelDirOps
+	}
+
+	if c.cfg.EnableAtomicTrunc {
+		initOp.Flags |= fusekernel.InitAtomicTrunc
+	}
+
+	if c.cfg.EnableReaddirplus {
+		// Enable Readdirplus support, allowing the kernel to use Readdirplus
+		initOp.Flags |= fusekernel.InitDoReaddirplus
+
+		if c.cfg.EnableAutoReaddirplus {
+			// Enable adaptive Readdirplus, allowing the kernel to choose between Readdirplus and Readdir
+			initOp.Flags |= fusekernel.InitReaddirplusAuto
+		}
+	}
+
+	return c.Reply(ctx, nil)
 }
 
 // Log information for an operation with the given ID. calldepth is the depth
@@ -301,13 +329,13 @@ func (c *Connection) handleInterrupt(fuseID uint64) {
 	defer c.mu.Unlock()
 
 	// NOTE(jacobsa): fuse.txt in the Linux kernel documentation
-	// (https://goo.gl/H55Dnr) defines the kernel <-> userspace protocol for
-	// interrupts.
+	// (https://tinyurl.com/2r4ajuwd) defines the kernel <-> userspace protocol
+	// for interrupts.
 	//
 	// In particular, my reading of it is that an interrupt request cannot be
 	// delivered to userspace before the original request. The part about the
 	// race and EAGAIN appears to be aimed at userspace programs that
-	// concurrently process requests (cf. http://goo.gl/BES2rs).
+	// concurrently process requests (https://tinyurl.com/3euehwfb).
 	//
 	// So in this method if we can't find the ID to be interrupted, it means that
 	// the request has already been replied to.
@@ -330,7 +358,7 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 
 	// Loop past transient errors.
 	for {
-		// Attempt a reaed.
+		// Attempt a read.
 		err := m.Init(c.dev)
 
 		// Special cases:
@@ -358,6 +386,23 @@ func (c *Connection) readMessage() (*buffer.InMessage, error) {
 
 		return m, nil
 	}
+}
+
+// Write a buffer.OutMessage to the kernel, with writev if vectored IO is useful
+// and write if not.
+func (c *Connection) writeOutMessage(outMsg *buffer.OutMessage) error {
+	var err error
+	if outMsg.Sglist != nil {
+		if fusekernel.IsPlatformFuseT {
+			// writev is not atomic on macos, restrict to fuse-t platform
+			writeLock.Lock()
+			defer writeLock.Unlock()
+		}
+		_, err = writev(int(c.dev.Fd()), outMsg.Sglist)
+	} else {
+		err = c.writeMessage(outMsg.OutHeaderBytes())
+	}
+	return err
 }
 
 // Write the supplied message to the kernel.
@@ -397,7 +442,7 @@ func (c *Connection) ReadOp() (_ context.Context, op interface{}, _ error) {
 
 		// Convert the message to an op.
 		outMsg := c.getOutMessage()
-		op, err = convertInMessage(inMsg, outMsg, c.protocol)
+		op, err = convertInMessage(&c.cfg, inMsg, outMsg, c.protocol)
 		if err != nil {
 			c.putOutMessage(outMsg)
 			return nil, nil, fmt.Errorf("convertInMessage: %v", err)
@@ -446,7 +491,7 @@ func (c *Connection) shouldLogError(
 			return false
 		}
 	case *fuseops.GetXattrOp, *fuseops.ListXattrOp:
-		if err == syscall.ENODATA || err == syscall.ERANGE {
+		if err == syscall.ENOSYS || err == syscall.ENODATA || err == syscall.ERANGE {
 			return false
 		}
 	case *unknownOp:
@@ -459,11 +504,13 @@ func (c *Connection) shouldLogError(
 	return true
 }
 
+var writeLock sync.Mutex
+
 // Reply replies to an op previously read using ReadOp, with the supplied error
 // (or nil if successful). The context must be the context returned by ReadOp.
 //
 // LOCKS_EXCLUDED(c.mu)
-func (c *Connection) Reply(ctx context.Context, opErr error) {
+func (c *Connection) Reply(ctx context.Context, opErr error) error {
 	// Extract the state we stuffed in earlier.
 	var key interface{} = contextKey
 	foo := ctx.Value(key)
@@ -477,36 +524,66 @@ func (c *Connection) Reply(ctx context.Context, opErr error) {
 	outMsg := state.outMsg
 	fuseID := inMsg.Header().Unique
 
-	// Make sure we destroy the messages when we're done.
-	defer c.putInMessage(inMsg)
-	defer c.putOutMessage(outMsg)
+	defer func() {
+		// Invoke any callbacks set by the FUSE server after the response to the kernel is
+		// complete and before the inMessage and outMessage memory buffers have been freed.
+		callback := c.callbackForOp(op)
+		if callback != nil {
+			callback()
+		}
+
+		// Make sure we destroy the messages when we're done.
+		c.putInMessage(inMsg)
+		c.putOutMessage(outMsg)
+	}()
 
 	// Clean up state for this op.
 	c.finishOp(inMsg.Header().Opcode, inMsg.Header().Unique)
 
+	logError := c.shouldLogError(op, opErr)
+
 	// Debug logging
 	if c.debugLogger != nil {
 		if opErr == nil {
-			c.debugLog(fuseID, 1, "-> OK (%s)", describeResponse(op))
+			c.debugLog(fuseID, 1, "-> %s", describeResponse(op))
 		} else {
-			c.debugLog(fuseID, 1, "-> Error: %q", opErr.Error())
+			if !logError {
+				c.debugLog(fuseID, 1, "-> Error: %q", opErr.Error())
+			}
 		}
 	}
 
 	// Error logging
-	if c.shouldLogError(op, opErr) {
-		c.errorLogger.Printf("%T error: %v", op, opErr)
+	if logError {
+		c.errorLogger.Printf("Op 0x%08x %T] -> Error: %q", fuseID, op, opErr)
 	}
 
 	// Send the reply to the kernel, if one is required.
 	noResponse := c.kernelResponse(outMsg, inMsg.Header().Unique, op, opErr)
 
 	if !noResponse {
-		err := c.writeMessage(outMsg.Bytes())
-		if err != nil && c.errorLogger != nil {
-			c.errorLogger.Printf("writeMessage: %v %v", err, outMsg.Bytes())
+		err := c.writeOutMessage(outMsg)
+		if err != nil {
+			writeErrMsg := fmt.Sprintf("writeMessage: %v %v", err, outMsg.OutHeaderBytes())
+			if c.errorLogger != nil {
+				c.errorLogger.Print(writeErrMsg)
+			}
+			return fmt.Errorf(writeErrMsg)
 		}
+		outMsg.Sglist = nil
 	}
+
+	return nil
+}
+
+func (c *Connection) callbackForOp(op interface{}) func() {
+	switch o := op.(type) {
+	case *fuseops.ReadFileOp:
+		return o.Callback
+	case *fuseops.WriteFileOp:
+		return o.Callback
+	}
+	return nil
 }
 
 // Close the connection. Must not be called until operations that were read

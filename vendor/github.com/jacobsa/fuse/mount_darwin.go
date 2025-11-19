@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/jacobsa/fuse/internal/buffer"
+	"github.com/jacobsa/fuse/internal/fusekernel"
 )
 
 var errNoAvail = errors.New("no available fuse devices")
@@ -37,16 +39,34 @@ type osxfuseInstallation struct {
 	// Environment variable used to pass the path to the executable calling the
 	// mount helper.
 	DaemonVar string
+
+	// Environment variable used to pass the "called by library" flag.
+	LibVar string
+
+	// Open device manually (false) or receive the FD through a UNIX socket,
+	// like with fusermount (true)
+	UseCommFD bool
 }
 
 var (
 	osxfuseInstallations = []osxfuseInstallation{
+		// v4
+		{
+			DevicePrefix: "/dev/macfuse",
+			Load:         "/Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse",
+			Mount:        "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
+			DaemonVar:    "_FUSE_DAEMON_PATH",
+			LibVar:       "_FUSE_CALL_BY_LIB",
+			UseCommFD:    true,
+		},
+
 		// v3
 		{
 			DevicePrefix: "/dev/osxfuse",
 			Load:         "/Library/Filesystems/osxfuse.fs/Contents/Resources/load_osxfuse",
 			Mount:        "/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
 			DaemonVar:    "MOUNT_OSXFUSE_DAEMON_PATH",
+			LibVar:       "MOUNT_OSXFUSE_CALL_BY_LIB",
 		},
 
 		// v2
@@ -55,9 +75,12 @@ var (
 			Load:         "/Library/Filesystems/osxfusefs.fs/Support/load_osxfusefs",
 			Mount:        "/Library/Filesystems/osxfusefs.fs/Support/mount_osxfusefs",
 			DaemonVar:    "MOUNT_FUSEFS_DAEMON_PATH",
+			LibVar:       "MOUNT_FUSEFS_CALL_BY_LIB",
 		},
 	}
 )
+
+const FUSET_SRV_PATH = "/usr/local/bin/go-nfsv4"
 
 func loadOSXFUSE(bin string) error {
 	cmd := exec.Command(bin)
@@ -92,50 +115,60 @@ func openOSXFUSEDev(devPrefix string) (dev *os.File, err error) {
 	}
 }
 
-func callMount(
-	bin string,
-	daemonVar string,
-	dir string,
-	cfg *MountConfig,
-	dev *os.File,
-	ready chan<- error) error {
+func convertMountArgs(daemonVar string, libVar string,
+	cfg *MountConfig) ([]string, []string, error) {
 
 	// The mount helper doesn't understand any escaping.
 	for k, v := range cfg.toMap() {
 		if strings.Contains(k, ",") || strings.Contains(v, ",") {
-			return fmt.Errorf(
+			return nil, nil, fmt.Errorf(
 				"mount options cannot contain commas on darwin: %q=%q",
 				k,
 				v)
 		}
 	}
 
-	// Call the mount helper, passing in the device file and saving output into a
-	// buffer.
-	cmd := exec.Command(
-		bin,
+	env := []string{libVar + "="}
+	if daemonVar != "" {
+		env = append(env, daemonVar+"="+os.Args[0])
+	}
+	argv := []string{
 		"-o", cfg.toOptionsString(),
 		// Tell osxfuse-kext how large our buffer is. It must split
 		// writes larger than this into multiple writes.
 		//
 		// OSXFUSE seems to ignore InitResponse.MaxWrite, and uses
 		// this instead.
-		"-o", "iosize="+strconv.FormatUint(buffer.MaxWriteSize, 10),
+		"-o", "iosize=" + strconv.FormatUint(buffer.MaxWriteSize, 10),
+	}
+
+	return argv, env, nil
+}
+
+func callMount(
+	bin string,
+	daemonVar string,
+	libVar string,
+	dir string,
+	cfg *MountConfig,
+	dev *os.File,
+	ready chan<- error) error {
+
+	argv, env, err := convertMountArgs(daemonVar, libVar, cfg)
+	if err != nil {
+		return err
+	}
+
+	// Call the mount helper, passing in the device file and saving output into a
+	// buffer.
+	argv = append(argv,
 		// refers to fd passed in cmd.ExtraFiles
 		"3",
 		dir,
 	)
+	cmd := exec.Command(bin, argv...)
 	cmd.ExtraFiles = []*os.File{dev}
-	cmd.Env = os.Environ()
-	// OSXFUSE <3.3.0
-	cmd.Env = append(cmd.Env, "MOUNT_FUSEFS_CALL_BY_LIB=")
-	// OSXFUSE >=3.3.0
-	cmd.Env = append(cmd.Env, "MOUNT_OSXFUSE_CALL_BY_LIB=")
-
-	daemon := os.Args[0]
-	if daemonVar != "" {
-		cmd.Env = append(cmd.Env, daemonVar+"="+daemon)
-	}
+	cmd.Env = env
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -162,11 +195,28 @@ func callMount(
 	return nil
 }
 
+func callMountCommFD(
+	bin string,
+	daemonVar string,
+	libVar string,
+	dir string,
+	cfg *MountConfig) (*os.File, error) {
+
+	argv, env, err := convertMountArgs(daemonVar, libVar, cfg)
+	if err != nil {
+		return nil, err
+	}
+	env = append(env, "_FUSE_COMMVERS=2")
+	argv = append(argv, dir)
+
+	return fusermount(bin, argv, env, false, cfg.DebugLogger)
+}
+
 // Begin the process of mounting at the given directory, returning a connection
 // to the kernel. Mounting continues in the background, and is complete when an
 // error is written to the supplied channel. The file system may need to
 // service the connection in order for mounting to complete.
-func mount(
+func mountOsxFuse(
 	dir string,
 	cfg *MountConfig,
 	ready chan<- error) (dev *os.File, err error) {
@@ -175,6 +225,16 @@ func mount(
 		if _, err := os.Stat(loc.Mount); os.IsNotExist(err) {
 			// try the other locations
 			continue
+		}
+
+		if loc.UseCommFD {
+			// Call the mount binary with the device.
+			ready <- nil
+			dev, err = callMountCommFD(loc.Mount, loc.DaemonVar, loc.LibVar, dir, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("callMount: %v", err)
+			}
+			return
 		}
 
 		// Open the device.
@@ -197,7 +257,7 @@ func mount(
 		}
 
 		// Call the mount binary with the device.
-		if err := callMount(loc.Mount, loc.DaemonVar, dir, cfg, dev, ready); err != nil {
+		if err := callMount(loc.Mount, loc.DaemonVar, loc.LibVar, dir, cfg, dev, ready); err != nil {
 			dev.Close()
 			return nil, fmt.Errorf("callMount: %v", err)
 		}
@@ -206,4 +266,162 @@ func mount(
 	}
 
 	return nil, errOSXFUSENotFound
+}
+
+func fusetBinary() (string, error) {
+	srv_path := os.Getenv("FUSE_NFSSRV_PATH")
+	if srv_path == "" {
+		srv_path = FUSET_SRV_PATH
+	}
+
+	if _, err := os.Stat(srv_path); err == nil {
+		return srv_path, nil
+	}
+
+	return "", fmt.Errorf("FUSE-T not found")
+}
+
+func unixgramSocketpair() (l, r *os.File, err error) {
+	fd, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, os.NewSyscallError("socketpair",
+			err.(syscall.Errno))
+	}
+	l = os.NewFile(uintptr(fd[0]), fmt.Sprintf("socketpair-half%d", fd[0]))
+	r = os.NewFile(uintptr(fd[1]), fmt.Sprintf("socketpair-half%d", fd[1]))
+	return
+}
+
+var local, local_mon, remote, remote_mon *os.File
+
+func startFuseTServer(binary string, argv []string,
+	additionalEnv []string,
+	wait bool,
+	debugLogger *log.Logger,
+	ready chan<- error) (*os.File, error) {
+	if debugLogger != nil {
+		debugLogger.Println("Creating a socket pair")
+	}
+
+	var err error
+	local, remote, err = unixgramSocketpair()
+	if err != nil {
+		return nil, err
+	}
+	defer remote.Close()
+
+	local_mon, remote_mon, err = unixgramSocketpair()
+	if err != nil {
+		return nil, err
+	}
+	defer remote_mon.Close()
+
+	syscall.CloseOnExec(int(local.Fd()))
+	syscall.CloseOnExec(int(local_mon.Fd()))
+
+	if debugLogger != nil {
+		debugLogger.Println("Creating files to wrap the sockets")
+	}
+
+	if debugLogger != nil {
+		debugLogger.Println("Starting fusermount/os mount")
+	}
+	// Start fusermount/mount_macfuse/mount_osxfuse.
+	cmd := exec.Command(binary, argv...)
+	cmd.Env = append(os.Environ(), "_FUSE_COMMFD=3")
+	cmd.Env = append(cmd.Env, "_FUSE_MONFD=4")
+	cmd.Env = append(cmd.Env, additionalEnv...)
+	cmd.ExtraFiles = []*os.File{remote, remote_mon}
+	cmd.Stderr = nil
+	cmd.Stdout = nil
+	// daemonize
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+	}
+
+	// Run the command.
+	err = cmd.Start()
+	cmd.Process.Release()
+	if err != nil {
+		return nil, fmt.Errorf("running %v: %v", binary, err)
+	}
+
+	if debugLogger != nil {
+		debugLogger.Println("Wrapping socket pair in a connection")
+	}
+
+	if debugLogger != nil {
+		debugLogger.Println("Checking that we have a unix domain socket")
+	}
+
+	if debugLogger != nil {
+		debugLogger.Println("Read a message from socket")
+	}
+
+	go func() {
+		if _, err = local_mon.Write([]byte("mount")); err != nil {
+			err = fmt.Errorf("fuse-t failed: %v", err)
+		} else {
+			reply := make([]byte, 4)
+			if _, err = local_mon.Read(reply); err != nil {
+				fmt.Printf("mount read  %v\n", err)
+				err = fmt.Errorf("fuse-t failed: %v", err)
+			}
+		}
+
+		ready <- err
+		close(ready)
+	}()
+
+	if debugLogger != nil {
+		debugLogger.Println("Successfully read the socket message.")
+	}
+
+	return local, nil
+}
+
+func mountFuset(
+	dir string,
+	cfg *MountConfig,
+	ready chan<- error) (dev *os.File, err error) {
+	fuseTBin, err := fusetBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	fusekernel.IsPlatformFuseT = true
+	env := []string{}
+	argv := []string{
+		fmt.Sprintf("--rwsize=%d", buffer.MaxWriteSize),
+	}
+
+	if cfg.VolumeName != "" {
+		argv = append(argv, "--volname")
+		argv = append(argv, cfg.VolumeName)
+	}
+	if cfg.ReadOnly {
+		argv = append(argv, "-r")
+	}
+
+	env = append(env, "_FUSE_COMMVERS=2")
+	argv = append(argv, dir)
+
+	return startFuseTServer(fuseTBin, argv, env, false, cfg.DebugLogger, ready)
+}
+
+func mount(
+	dir string,
+	cfg *MountConfig,
+	ready chan<- error) (dev *os.File, err error) {
+
+	fusekernel.IsPlatformFuseT = false
+	switch cfg.FuseImpl {
+	case FUSEImplMacFUSE:
+		dev, err = mountOsxFuse(dir, cfg, ready)
+	case FUSEImplFuseT:
+		fallthrough
+	default:
+		dev, err = mountFuset(dir, cfg, ready)
+	}
+	return
 }

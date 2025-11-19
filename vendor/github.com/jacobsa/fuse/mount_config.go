@@ -50,7 +50,7 @@ type MountConfig struct {
 	// Linux only. OS X always behaves as if writeback caching is disabled.
 	//
 	// By default on Linux we allow the kernel to perform writeback caching
-	// (cf. http://goo.gl/LdZzo1):
+	// (https://tinyurl.com/3ma8ypeu):
 	//
 	// *   When the user calls write(2), the kernel sticks the user's data into
 	//     its page cache. Only later does it call through to the file system,
@@ -65,7 +65,7 @@ type MountConfig struct {
 	//
 	// *   close(2) (and anything else calling f_op->flush) causes all dirty
 	//     pages to be written out before it proceeds to send a FlushFileOp
-	//     (cf. https://goo.gl/TMrY6X).
+	//     (https://tinyurl.com/3ur6vmsv).
 	//
 	// *   Similarly, close(2) causes the kernel to send a setattr request
 	//     filling in the mtime if any dirty pages were flushed, since the time
@@ -78,22 +78,23 @@ type MountConfig struct {
 	//
 	//     Code walk:
 	//
-	//     *   (https://goo.gl/zTIZQ9) fuse_flush calls write_inode_now before
-	//         calling the file system. The latter eventually calls into
+	//     *   (https://tinyurl.com/3ur6vmsv) fuse_flush calls write_inode_now
+	//         before calling the file system. The latter eventually calls into
 	//         __writeback_single_inode.
 	//
-	//     *   (https://goo.gl/L7Z2w5) __writeback_single_inode calls
+	//     *   (https://tinyurl.com/35vtmtsz) __writeback_single_inode calls
 	//         do_writepages, which writes out any dirty pages.
 	//
-	//     *   (https://goo.gl/DOPgla) __writeback_single_inode later calls
-	//         write_inode, which calls into the superblock op struct's write_inode
-	//         member. For fuse, this is fuse_write_inode
-	//         (cf. https://goo.gl/eDSKOX).
+	//     *   (https://tinyurl.com/3wv4paaf) __writeback_single_inode later
+	//         calls write_inode, which calls into the superblock op struct's
+	//         write_inode member. For fuse, this is fuse_write_inode
+	//         (https://tinyurl.com/mrxupe98).
 	//
-	//     *   (https://goo.gl/PbkGA1) fuse_write_inode calls fuse_flush_times.
+	//     *   (https://tinyurl.com/mrxt9bta) fuse_write_inode calls
+	//         fuse_flush_times.
 	//
-	//     *   (https://goo.gl/ig8x9V) fuse_flush_times sends a setttr request
-	//         for setting the inode's mtime.
+	//     *   (https://tinyurl.com/mr49cjdf) fuse_flush_times sends a setttr
+	//         request for setting the inode's mtime.
 	//
 	// However, this brings along some caveats:
 	//
@@ -102,11 +103,11 @@ type MountConfig struct {
 	//
 	// *   The kernel caches mtime and ctime regardless of whether the file
 	//     system tells it to do so, disregarding the result of further getattr
-	//     requests (cf. https://goo.gl/3ZZMUw, https://goo.gl/7WtQUp). It
-	//     appears this may be true of the file size, too. Writeback caching may
-	//     therefore not be suitable for file systems where these attributes can
-	//     spontaneously change for reasons the kernel doesn't observe. See
-	//     http://goo.gl/V5WQCN for more discussion.
+	//     requests (https://tinyurl.com/mrxnfatv, https://tinyurl.com/27jju8n4).
+	//     It appears this may be true of the file size, too. Writeback caching
+	//     may therefore not be suitable for file systems where these attributes
+	//     can spontaneously change for reasons the kernel doesn't observe. See
+	//     https://tinyurl.com/yyprvjvs for more discussion.
 	//
 	// Setting DisableWritebackCaching disables this behavior. Instead the file
 	// system is called one or more times for each write(2), and the user's
@@ -116,12 +117,12 @@ type MountConfig struct {
 	// OS X only.
 	//
 	// Normally on OS X we mount with the novncache option
-	// (cf. http://goo.gl/1pTjuk), which disables entry caching in the kernel.
-	// This is because osxfuse does not honor the entry expiration values we
-	// return to it, instead caching potentially forever (cf.
-	// http://goo.gl/8yR0Ie), and it is probably better to fail to cache than to
-	// cache for too long, since the latter is more likely to hide consistency
-	// bugs that are difficult to detect and diagnose.
+	// (https://tinyurl.com/52hz9vya), which disables entry caching in the
+	// kernel. This is because macFUSE (osxfuse) does not honor the entry
+	// expiration values we return to it, instead caching potentially forever
+	// (https://tinyurl.com/2rr6cd3m), and it is probably better to fail to cache
+	// than to cache for too long, since the latter is more likely to hide
+	// consistency bugs that are difficult to detect and diagnose.
 	//
 	// This field disables the use of novncache, restoring entry caching. Beware:
 	// the value of ChildInodeEntry.EntryExpiration is ignored by the kernel, and
@@ -159,8 +160,15 @@ type MountConfig struct {
 	// OS X only.
 	//
 	// The name of the mounted volume, as displayed in the Finder. If empty, a
-	// default name involving the string 'osxfuse' is used.
+	// default name involving the string 'osxfuse' (the old name of macFUSE)
+	// is used.
 	VolumeName string
+
+	// OS X only.
+	//
+	// The FUSE implementation to use. One of FUSEImplFuseT (default) or
+	// FUSEImplMacFUSE.
+	FuseImpl FUSEImpl
 
 	// Additional key=value options to pass unadulterated to the underlying mount
 	// command. See `man 8 mount`, the fuse documentation, etc. for
@@ -174,7 +182,68 @@ type MountConfig struct {
 	// /proc/mounts will show the filesystem type as fuse.<Subtype>.
 	// If not set, /proc/mounts will show the filesystem type as fuse/fuseblk.
 	Subtype string
+
+	// Flag to enable async reads that are received from
+	// the kernel
+	EnableAsyncReads bool
+
+	// Flag to enable parallel lookup and readdir operations from the
+	// kernel
+	// Ref: https://github.com/torvalds/linux/commit/5c672ab3f0ee0f78f7acad183f34db0f8781a200
+	EnableParallelDirOps bool
+
+	// Flag to enable atomic truncate during file open operations.
+	// When enabled, application calls to open with the O_TRUNC flag will cause a FUSE OpenFile
+	// op with the O_TRUNC flag set. In comparison, the default behavior is an OpenFile op
+	// without O_TRUNC, followed by a SetInodeAttributes op with the target size set to 0.
+	// Ref: https://github.com/torvalds/linux/commit/6ff958edbf39c014eb06b65ad25b736be08c4e63
+	EnableAtomicTrunc bool
+
+	// Flag to tell the kernel we support ReadDirPlus, which optimizes performance
+	// by returning not just the directory entries (like ReadDir), but also their inode
+	// attributes, thereby saving one extra Lookup request per directory entry.
+	EnableReaddirplus bool
+
+	// Flag to enable adaptive ReadDirPlus.
+	// This is only effective if EnableReaddirplus is true.
+	//
+	// When both flags are set, the kernel may dynamically choose between issuing
+	// ReaddirPlus and Readdir requests based on observed access patterns.
+	// For example, `ls` (which lists filenames only) may fall back to Readdir after an initial ReaddirPlus,
+	// whereas `ls -l` is more likely to continue using ReaddirPlus.
+	//
+	// If EnableReaddirplus is true and this flag is false, the kernel will always
+	// use ReaddirPlus for directory listing.
+	EnableAutoReaddirplus bool
+
+	// UseVectoredRead is a legacy flag kept for backward compatibility. It is now a no-op.
+	//
+	// The term vectored read was a misnomer for this flag. Its actual meaning was that
+	// the file system would allocate its own buffers for read operations.
+	//
+	// When this flag was disabled, the FUSE library provided a buffer
+	// in ReadFileOp.Dst. This buffer utilized unused space within the
+	// incoming kernel request message's buffer (InMessage.storage), which is
+	// sized to hold a page plus the maximum write size. Since read requests are
+	// small, there is ample room for read responses.
+	//
+	// Conversely, when this flag was enabled, ReadFileOp.Dst was always nil.
+	// This allowed file systems to avoid memory copying overhead if the data was
+	// already in memory, by requiring them to return the data as a list of slices
+	// in ReadFileOp.Data.
+	//
+	// Currently, both the read mechanisms can coexist. The library's behavior is
+	// to always provide ReadFileOp.Dst. If the file system populates ReadFileOp.Data,
+	// that data will be used for a vectored read, irrespective of this flag's value.
+	UseVectoredRead bool
 }
+
+type FUSEImpl uint8
+
+const (
+	FUSEImplFuseT = iota
+	FUSEImplMacFUSE
+)
 
 // Create a map containing all of the key=value mount options to be given to
 // the mount helper.

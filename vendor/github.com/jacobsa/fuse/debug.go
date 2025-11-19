@@ -86,10 +86,16 @@ func describeRequest(op interface{}) (s string) {
 			addComponent("mtime %v", *typed.Mtime)
 		}
 
+	case *fuseops.RenameOp:
+		addComponent("old_parent %v", typed.OldParent)
+		addComponent("old_name %q", typed.OldName)
+		addComponent("new_parent %v", typed.NewParent)
+		addComponent("new_name %q", typed.NewName)
+
 	case *fuseops.ReadFileOp:
 		addComponent("handle %d", typed.Handle)
 		addComponent("offset %d", typed.Offset)
-		addComponent("%d bytes", len(typed.Dst))
+		addComponent("%d bytes", typed.Size)
 
 	case *fuseops.WriteFileOp:
 		addComponent("handle %d", typed.Handle)
@@ -109,6 +115,9 @@ func describeRequest(op interface{}) (s string) {
 		addComponent("offset %d", typed.Offset)
 		addComponent("length %d", typed.Length)
 		addComponent("mode %d", typed.Mode)
+
+	case *fuseops.ReleaseFileHandleOp:
+		addComponent("handle %d", typed.Handle)
 	}
 
 	// Use just the name if there is no extra info.
@@ -135,6 +144,10 @@ func describeResponse(op interface{}) string {
 			addComponent("inode %v", entry.Child)
 		}
 	}
+	switch typed := op.(type) {
+	case *fuseops.OpenFileOp:
+		addComponent("handle %d", typed.Handle)
+	}
 
-	return fmt.Sprintf("%s", strings.Join(components, ", "))
+	return fmt.Sprintf("%s (%s)", opName(op), strings.Join(components, ", "))
 }

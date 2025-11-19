@@ -39,6 +39,7 @@ type FileSystem interface {
 	GetInodeAttributes(context.Context, *fuseops.GetInodeAttributesOp) error
 	SetInodeAttributes(context.Context, *fuseops.SetInodeAttributesOp) error
 	ForgetInode(context.Context, *fuseops.ForgetInodeOp) error
+	BatchForget(context.Context, *fuseops.BatchForgetOp) error
 	MkDir(context.Context, *fuseops.MkDirOp) error
 	MkNode(context.Context, *fuseops.MkNodeOp) error
 	CreateFile(context.Context, *fuseops.CreateFileOp) error
@@ -49,6 +50,7 @@ type FileSystem interface {
 	Unlink(context.Context, *fuseops.UnlinkOp) error
 	OpenDir(context.Context, *fuseops.OpenDirOp) error
 	ReadDir(context.Context, *fuseops.ReadDirOp) error
+	ReadDirPlus(context.Context, *fuseops.ReadDirPlusOp) error
 	ReleaseDirHandle(context.Context, *fuseops.ReleaseDirHandleOp) error
 	OpenFile(context.Context, *fuseops.OpenFileOp) error
 	ReadFile(context.Context, *fuseops.ReadFileOp) error
@@ -62,6 +64,7 @@ type FileSystem interface {
 	ListXattr(context.Context, *fuseops.ListXattrOp) error
 	SetXattr(context.Context, *fuseops.SetXattrOp) error
 	Fallocate(context.Context, *fuseops.FallocateOp) error
+	SyncFS(context.Context, *fuseops.SyncFSOp) error
 
 	// Regard all inodes (including the root inode) as having their lookup counts
 	// decremented to zero, and clean up any resources associated with the file
@@ -80,8 +83,8 @@ type FileSystem interface {
 //
 // (It is safe to naively process ops concurrently because the kernel
 // guarantees to serialize operations that the user expects to happen in order,
-// cf. http://goo.gl/jnkHPO, fuse-devel thread "Fuse guarantees on concurrent
-// requests").
+// cf. https://tinyurl.com/bddm85v5, fuse-devel thread "Fuse guarantees on
+// concurrent requests").
 func NewFileSystemServer(fs FileSystem) fuse.Server {
 	return &fileSystemServer{
 		fs: fs,
@@ -151,6 +154,22 @@ func (s *fileSystemServer) handleOp(
 	case *fuseops.ForgetInodeOp:
 		err = s.fs.ForgetInode(ctx, typed)
 
+	case *fuseops.BatchForgetOp:
+		err = s.fs.BatchForget(ctx, typed)
+		if err == fuse.ENOSYS {
+			// Handle as a series of single-inode forget operations
+			for _, entry := range typed.Entries {
+				err = s.fs.ForgetInode(ctx, &fuseops.ForgetInodeOp{
+					Inode:     entry.Inode,
+					N:         entry.N,
+					OpContext: typed.OpContext,
+				})
+				if err != nil {
+					break
+				}
+			}
+		}
+
 	case *fuseops.MkDirOp:
 		err = s.fs.MkDir(ctx, typed)
 
@@ -180,6 +199,9 @@ func (s *fileSystemServer) handleOp(
 
 	case *fuseops.ReadDirOp:
 		err = s.fs.ReadDir(ctx, typed)
+
+	case *fuseops.ReadDirPlusOp:
+		err = s.fs.ReadDirPlus(ctx, typed)
 
 	case *fuseops.ReleaseDirHandleOp:
 		err = s.fs.ReleaseDirHandle(ctx, typed)
@@ -219,6 +241,9 @@ func (s *fileSystemServer) handleOp(
 
 	case *fuseops.FallocateOp:
 		err = s.fs.Fallocate(ctx, typed)
+
+	case *fuseops.SyncFSOp:
+		err = s.fs.SyncFS(ctx, typed)
 	}
 
 	c.Reply(ctx, err)

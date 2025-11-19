@@ -44,9 +44,9 @@ import (
 // The FUSE version implemented by the package.
 const (
 	ProtoVersionMinMajor = 7
-	ProtoVersionMinMinor = 8
+	ProtoVersionMinMinor = 18
 	ProtoVersionMaxMajor = 7
-	ProtoVersionMaxMinor = 12
+	ProtoVersionMaxMinor = 34
 )
 
 const (
@@ -199,6 +199,11 @@ func (fl OpenFlags) IsReadWrite() bool {
 	return fl&OpenAccessModeMask == OpenReadWrite
 }
 
+// Return true if OpenAppend is set.
+func (fl OpenFlags) IsAppend() bool {
+	return fl&OpenAppend != 0
+}
+
 func accModeName(flags OpenFlags) string {
 	switch flags {
 	case OpenReadOnly:
@@ -227,6 +232,7 @@ const (
 	OpenDirectIO    OpenResponseFlags = 1 << 0 // bypass page cache for this open file
 	OpenKeepCache   OpenResponseFlags = 1 << 1 // don't invalidate the data cache on open
 	OpenNonSeekable OpenResponseFlags = 1 << 2 // mark the file as non-seekable (not supported on OS X)
+	OpenCacheDir    OpenResponseFlags = 1 << 3 // allow caching this directory
 
 	OpenPurgeAttr OpenResponseFlags = 1 << 30 // OS X
 	OpenPurgeUBC  OpenResponseFlags = 1 << 31 // OS X
@@ -240,6 +246,7 @@ var openResponseFlagNames = []flagName{
 	{uint32(OpenDirectIO), "OpenDirectIO"},
 	{uint32(OpenKeepCache), "OpenKeepCache"},
 	{uint32(OpenNonSeekable), "OpenNonSeekable"},
+	{uint32(OpenCacheDir), "OpenCacheDir"},
 	{uint32(OpenPurgeAttr), "OpenPurgeAttr"},
 	{uint32(OpenPurgeUBC), "OpenPurgeUBC"},
 }
@@ -266,6 +273,8 @@ const (
 	InitAsyncDIO         InitFlags = 1 << 15
 	InitWritebackCache   InitFlags = 1 << 16
 	InitNoOpenSupport    InitFlags = 1 << 17
+	InitParallelDirOps   InitFlags = 1 << 18
+	InitMaxPages         InitFlags = 1 << 22
 	InitCacheSymlinks    InitFlags = 1 << 23
 	InitNoOpendirSupport InitFlags = 1 << 24
 
@@ -286,6 +295,7 @@ var initFlagNames = []flagName{
 	{uint32(InitAtomicTrunc), "InitAtomicTrunc"},
 	{uint32(InitExportSupport), "InitExportSupport"},
 	{uint32(InitBigWrites), "InitBigWrites"},
+	{uint32(InitMaxPages), "InitMaxPages"},
 	{uint32(InitDontMask), "InitDontMask"},
 	{uint32(InitSpliceWrite), "InitSpliceWrite"},
 	{uint32(InitSpliceMove), "InitSpliceMove"},
@@ -384,7 +394,16 @@ const (
 	OpDestroy     = 38
 	OpIoctl       = 39 // Linux?
 	OpPoll        = 40 // Linux?
+	OpBatchForget = 42
 	OpFallocate   = 43
+	OpReaddirplus = 44
+	//
+	OpRename2       = 45
+	OpLseek         = 46
+	OpCopyFileRange = 47
+	OpSetupMapping  = 48
+	OpRemoveMapping = 49
+	OpSyncFS        = 50
 
 	// OS X
 	OpSetvolname = 61
@@ -412,6 +431,16 @@ func EntryOutSize(p Protocol) uintptr {
 }
 
 type ForgetIn struct {
+	Nlookup uint64
+}
+
+type BatchForgetCountIn struct {
+	Count uint32
+	dummy uint32
+}
+
+type BatchForgetEntryIn struct {
+	Inode   int64
 	Nlookup uint64
 }
 
@@ -714,12 +743,17 @@ type InitIn struct {
 const InitInSize = int(unsafe.Sizeof(InitIn{}))
 
 type InitOut struct {
-	Major        uint32
-	Minor        uint32
-	MaxReadahead uint32
-	Flags        uint32
-	Unused       uint32
-	MaxWrite     uint32
+	Major               uint32
+	Minor               uint32
+	MaxReadahead        uint32
+	Flags               uint32
+	MaxBackground       uint16
+	CongestionThreshold uint16
+	MaxWrite            uint32
+	TimeGran            uint32
+	MaxPages            uint16
+	MapAlignment        uint16
+	Unused              [8]uint32
 }
 
 type InterruptIn struct {
@@ -781,4 +815,8 @@ type NotifyInvalEntryOut struct {
 	Parent  uint64
 	Namelen uint32
 	padding uint32
+}
+
+type SyncFSIn struct {
+	Padding uint64
 }

@@ -1,12 +1,12 @@
 package fuse
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -21,92 +21,6 @@ func findFusermount() (string, error) {
 		return "", err
 	}
 	return path, nil
-}
-
-func fusermount(dir string, cfg *MountConfig) (*os.File, error) {
-	// Create a socket pair.
-	fds, err := syscall.Socketpair(syscall.AF_FILE, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, fmt.Errorf("Socketpair: %v", err)
-	}
-
-	// Wrap the sockets into os.File objects that we will pass off to fusermount.
-	writeFile := os.NewFile(uintptr(fds[0]), "fusermount-child-writes")
-	defer writeFile.Close()
-
-	readFile := os.NewFile(uintptr(fds[1]), "fusermount-parent-reads")
-	defer readFile.Close()
-
-	// Start fusermount, passing it a buffer in which to write stderr.
-	var stderr bytes.Buffer
-
-	fusermount, err := findFusermount()
-	if err != nil {
-		return nil, err
-	}
-	cmd := exec.Command(
-		fusermount,
-		"-o", cfg.toOptionsString(),
-		"--",
-		dir,
-	)
-
-	cmd.Env = append(os.Environ(), "_FUSE_COMMFD=3")
-	cmd.ExtraFiles = []*os.File{writeFile}
-	cmd.Stderr = &stderr
-
-	// Run the command.
-	err = cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("running fusermount: %v\n\nstderr:\n%s", err, stderr.Bytes())
-	}
-
-	// Wrap the socket file in a connection.
-	c, err := net.FileConn(readFile)
-	if err != nil {
-		return nil, fmt.Errorf("FileConn: %v", err)
-	}
-	defer c.Close()
-
-	// We expect to have a Unix domain socket.
-	uc, ok := c.(*net.UnixConn)
-	if !ok {
-		return nil, fmt.Errorf("Expected UnixConn, got %T", c)
-	}
-
-	// Read a message.
-	buf := make([]byte, 32) // expect 1 byte
-	oob := make([]byte, 32) // expect 24 bytes
-	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
-	if err != nil {
-		return nil, fmt.Errorf("ReadMsgUnix: %v", err)
-	}
-
-	// Parse the message.
-	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return nil, fmt.Errorf("ParseSocketControlMessage: %v", err)
-	}
-
-	// We expect one message.
-	if len(scms) != 1 {
-		return nil, fmt.Errorf("expected 1 SocketControlMessage; got scms = %#v", scms)
-	}
-
-	scm := scms[0]
-
-	// Pull out the FD returned by fusermount
-	gotFds, err := syscall.ParseUnixRights(&scm)
-	if err != nil {
-		return nil, fmt.Errorf("syscall.ParseUnixRights: %v", err)
-	}
-
-	if len(gotFds) != 1 {
-		return nil, fmt.Errorf("wanted 1 fd; got %#v", gotFds)
-	}
-
-	// Turn the FD into an os.File.
-	return os.NewFile(uintptr(gotFds[0]), "/dev/fuse"), nil
 }
 
 func enableFunc(flag uintptr) func(uintptr) uintptr {
@@ -141,6 +55,9 @@ var mountflagopts = map[string]func(uintptr) uintptr{
 var errFallback = errors.New("sentinel: fallback to fusermount(1)")
 
 func directmount(dir string, cfg *MountConfig) (*os.File, error) {
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Preparing for direct mounting")
+	}
 	// We use syscall.Open + os.NewFile instead of os.OpenFile so that the file
 	// is opened in blocking mode. When opened in non-blocking mode, the Go
 	// runtime tries to use poll(2), which does not work with /dev/fuse.
@@ -149,6 +66,10 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 		return nil, errFallback
 	}
 	dev := os.NewFile(uintptr(fd), "/dev/fuse")
+
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Successfully opened the /dev/fuse in blocking mode")
+	}
 	// As per libfuse/fusermount.c:847: https://bit.ly/2SgtWYM#L847
 	data := fmt.Sprintf("fd=%d,rootmode=40000,user_id=%d,group_id=%d",
 		dev.Fd(), os.Getuid(), os.Getgid())
@@ -163,6 +84,7 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 		mountflag = fn(mountflag)
 		delete(opts, k)
 	}
+	fsname := opts["fsname"]
 	delete(opts, "fsname") // handled via fstype mount(2) parameter
 	fstype := "fuse"
 	if subtype, ok := opts["subtype"]; ok {
@@ -170,18 +92,25 @@ func directmount(dir string, cfg *MountConfig) (*os.File, error) {
 	}
 	delete(opts, "subtype")
 	data += "," + mapToOptionsString(opts)
+
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Starting the unix mounting")
+	}
 	if err := unix.Mount(
-		cfg.FSName, // source
-		dir,        // target
-		fstype,     // fstype
-		mountflag,  // mountflag
-		data,       // data
+		fsname,    // source
+		dir,       // target
+		fstype,    // fstype
+		mountflag, // mountflag
+		data,      // data
 	); err != nil {
 		if err == syscall.EPERM {
 			return nil, errFallback
 
 		}
 		return nil, err
+	}
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Unix mounting completed successfully")
 	}
 	return dev, nil
 }
@@ -194,11 +123,57 @@ func mount(dir string, cfg *MountConfig, ready chan<- error) (*os.File, error) {
 	// On linux, mounting is never delayed.
 	ready <- nil
 
+	if cfg.DebugLogger != nil {
+		cfg.DebugLogger.Println("Parsing fuse file descriptor")
+	}
+	// If the mountpoint is /dev/fd/N, assume that the file descriptor N is an
+	// already open FUSE channel. Parse it, cast it to an fd, and don't do any
+	// other part of the mount dance.
+	if fd, err := parseFuseFd(dir); err == nil {
+		dev := os.NewFile(uintptr(fd), "/dev/fuse")
+		return dev, nil
+	}
+
 	// Try mounting without fusermount(1) first: we might be running as root or
 	// have the CAP_SYS_ADMIN capability.
 	dev, err := directmount(dir, cfg)
 	if err == errFallback {
-		return fusermount(dir, cfg)
+		if cfg.DebugLogger != nil {
+			cfg.DebugLogger.Println("Directmount failed. Trying fallback.")
+		}
+		fusermountPath, err := findFusermount()
+		if err != nil {
+			return nil, err
+		}
+		argv := []string{
+			"-o", cfg.toOptionsString(),
+			"--",
+			dir,
+		}
+		dev, err := fusermount(fusermountPath, argv, []string{}, true, cfg.DebugLogger)
+		if err == nil {
+			return dev, nil
+		}
+		// fusermount requires the mount user to have write access to the directory.
+		// However, it doesn't give a useful error on mount-failure if the access is missing.
+		// So, add this check and return a useful error if the user doesn't have write-access.
+		if err2 := unix.Access(dir, unix.W_OK); err2 != nil {
+			return nil, errors.Join(err, fmt.Errorf("the user doesn't have write-access on the mount point: %w", err2))
+		}
+		return dev, err
 	}
 	return dev, err
+}
+
+func parseFuseFd(dir string) (int, error) {
+	if !strings.HasPrefix(dir, "/dev/fd/") {
+		return -1, fmt.Errorf("not a /dev/fd path")
+	}
+
+	fd, err := strconv.ParseUint(strings.TrimPrefix(dir, "/dev/fd/"), 10, 32)
+	if err != nil {
+		return -1, fmt.Errorf("invalid /dev/fd/N path: N must be a positive integer")
+	}
+
+	return int(fd), nil
 }
